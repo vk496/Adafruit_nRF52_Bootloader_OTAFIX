@@ -1,0 +1,126 @@
+# Rolling DEV bootloader release (fork convenience).
+#
+# On every push, rebuild the bootloader for every board and replace the assets of ONE rolling prerelease
+# (tag `dev-latest`) so testers can always grab the current bootloader from the same place. Mirrors the
+# MeshCore firmware `dev-firmware-rolling.yml` workflow.
+#
+# These are UNSIGNED development builds for testing only — not official releases. The OTAFIX in-place OTA
+# apply is validated on `wiscore_rak4631_board` (RAK4631); other boards are built best-effort and may fail
+# the 40 KB bootloader size limit once the detools/sha256 OTA code is included — those just don't ship.
+# `release: created` still drives the official per-board release upload in `githubci.yml`.
+#
+# To build only specific boards, replace the `set-matrix` output with a fixed list, e.g.
+#   matrix: { board: [wiscore_rak4631_board] }
+
+name: Dev Bootloader (rolling)
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-bootloader-rolling
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: dev-latest
+
+jobs:
+  set-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Set matrix from src/boards
+        id: set-matrix
+        working-directory: src/boards
+        run: |
+          MATRIX_JSON=$(ls -d */ | sed 's/\/$//' | jq -R -s -c 'split("\n")[:-1]')
+          echo "matrix=$MATRIX_JSON"
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+
+  build:
+    needs: set-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false           # a board that overflows 40 KB shouldn't block the others
+      matrix:
+        board: ${{ fromJSON(needs.set-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # for git-describe version string
+          submodules: true        # nRF5 SDK / softdevice live in submodules
+
+      - name: Install ARM GCC
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '12.3.Rel1'
+
+      - name: Install Tools
+        run: pip3 install adafruit-nrfutil uritemplate requests intelhex setuptools
+
+      - name: Build ${{ matrix.board }}
+        run: |
+          make BOARD=${{ matrix.board }} all
+          make BOARD=${{ matrix.board }} copy-artifact
+
+      - name: Upload ${{ matrix.board }} artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.board }}
+          path: _bin/${{ matrix.board }}
+          if-no-files-found: ignore
+          retention-days: 5
+
+  release:
+    needs: [set-matrix, build]
+    if: always()                 # publish whatever built, even if some boards failed the size limit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download all board artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true   # flatten every board's files into dist/ (filenames are board-prefixed)
+
+      - name: Replace the rolling dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(ls -A dist 2>/dev/null)" ]; then
+            echo "::error::nothing built — not touching the release"; exit 1
+          fi
+          echo "Assets:"; ls -la dist
+          # delete the previous release + its tag so old binaries disappear, then recreate at HEAD
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          NOTES=$(cat <<EOF
+          **Automatic development bootloader build — latest commit on \`${GITHUB_REF_NAME}\`.**
+
+          - Commit: \`${GITHUB_SHA}\`
+          - Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ⚠️ Unsigned dev builds for testing only. Assets here are replaced on every push (this release
+          always tracks the latest commit). The OTAFIX in-place OTA apply is validated on **RAK4631**
+          (\`wiscore_rak4631_board\`); other boards are best-effort and may be missing if they exceed the
+          40 KB bootloader size limit with the OTA code included.
+
+          Per board: \`*_bootloader-*.zip\` (DFU), \`*_bootloader-*.hex\` (full flash, SWD/J-Link), and
+          \`update-*_bootloader-*.uf2\` (drag-drop self-update from a running bootloader).
+          EOF
+          )
+          gh release create "$RELEASE_TAG" dist/* \
+            --title "Dev bootloader (latest commit)" \
+            --notes "$NOTES" \
+            --prerelease \
+            --target "$GITHUB_SHA"

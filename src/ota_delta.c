@@ -154,16 +154,16 @@ static int parse_mota_at(uint32_t addr, struct mota_min* o) {
   uint8_t b[200];
   uint32_t avail = MOTA_NRF52_FS_START - addr;
   uint32_t hdr = avail < sizeof(b) ? avail : sizeof(b);
-  if (hdr < 8 + 57 + 4 + 5) return 0;
+  if (hdr < 8 + 89 + 4 + 5) return 0;               // fixed head is 89 in v2 (57 + hw_id[32])
   fl_read(addr, b, hdr);
   if (memcmp(b, MAGIC, 4) != 0) return 0;
   uint32_t total = rd_u32(b + 4);
-  if (total < 8 + 57 + 4 + 5 || total > avail) return 0;
+  if (total < 8 + 89 + 4 + 5 || total > avail) return 0;
   uint8_t tr[5]; fl_read(addr + total - 5, tr, 5);
   if (memcmp(tr, TRAILER, 5) != 0) return 0;
 
   const uint8_t* p = b + 8;
-  if (p[0] != 1) return 0;                          // format_ver
+  if (p[0] != 2) return 0;                          // format_ver (v2: adds hw_id[32] to the fixed head)
   uint8_t flags = p[1];
   o->image_size   = rd_u32(p + 11);
   o->payload_size = rd_u32(p + 15);
@@ -171,7 +171,7 @@ static int parse_mota_at(uint32_t addr, struct mota_min* o) {
   memcpy(o->image_hash, p + 24, 32);
   o->codec_id     = p[56];
   o->is_full      = (flags & MFLAG_FULL) ? 1 : 0;
-  uint32_t off = 8 + 57;                            // offset within the mota, after the fixed head
+  uint32_t off = 8 + 89;                            // after the fixed head (57 + hw_id[32]); hw_id unused here
   if (!o->is_full) { memcpy(o->base_hash, b + off, 8); off += 8; }
   if (flags & MFLAG_SIGNED) { off += 32 + 64; }     // skip signer pubkey + signature
   if (off + 4 > hdr) return 0;
@@ -198,7 +198,7 @@ static int parse_mota_at(uint32_t addr, struct mota_min* o) {
 // approved. (EndF is the mirror image: the app image grows up from APP_BASE, so the current trailer is
 // the LOWEST valid marker and find_body_len scans bottom-up. Each marker is scanned from the end where
 // the current one is encountered first.)
-#define MOTA_MIN_LEN  (8 + 57 + 4 + 5)
+#define MOTA_MIN_LEN  (8 + 89 + 4 + 5)
 static uint32_t scan_mota(struct mota_min* o) {
   uint32_t top = (MOTA_NRF52_FS_START - MOTA_MIN_LEN) & ~(PAGE - 1);
   for (uint32_t a = top + PAGE; a > APP_BASE; ) {        // walk page boundaries high -> low
