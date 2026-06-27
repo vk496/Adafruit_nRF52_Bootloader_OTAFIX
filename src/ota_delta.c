@@ -67,6 +67,14 @@ static uint32_t rd_u32(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+// Tiny bounds-checked cursor so the manifest is parsed by reading each field by name in order, instead of
+// hand-computed offsets (mirrors MeshCore's OtaByteIO.h ByteReader). Any over-read flips ok=0.
+typedef struct { const uint8_t* p; uint32_t len, n; int ok; } br_t;
+static uint8_t  br_u8(br_t* r)  { if (r->ok && (uint64_t)r->n + 1 <= r->len) return r->p[r->n++]; r->ok = 0; return 0; }
+static uint32_t br_u32(br_t* r) { if (r->ok && (uint64_t)r->n + 4 <= r->len) { uint32_t v = rd_u32(r->p + r->n); r->n += 4; return v; } r->ok = 0; return 0; }
+static const uint8_t* br_take(br_t* r, uint32_t k) { if (r->ok && (uint64_t)r->n + k <= r->len) { const uint8_t* x = r->p + r->n; r->n += k; return x; } r->ok = 0; return NULL; }
+static void br_skip(br_t* r, uint32_t k) { if (r->ok && (uint64_t)r->n + k <= r->len) r->n += k; else r->ok = 0; }
+
 static void sha256_region(uint32_t addr, uint32_t len, uint8_t out[32]) {
   sha256_ctx_t c; sha256_init(&c);
   uint8_t buf[256];
@@ -162,25 +170,30 @@ static int parse_mota_at(uint32_t addr, struct mota_min* o) {
   uint8_t tr[5]; fl_read(addr + total - 5, tr, 5);
   if (memcmp(tr, TRAILER, 5) != 0) return 0;
 
-  const uint8_t* p = b + 8;
-  if (p[0] != 2) return 0;                          // format_ver (v2: adds hw_id[32] to the fixed head)
-  uint8_t flags = p[1];
-  o->image_size   = rd_u32(p + 11);
-  o->payload_size = rd_u32(p + 15);
-  uint8_t bsl     = p[19];
-  memcpy(o->image_hash, p + 24, 32);
-  o->codec_id     = p[56];
+  // manifest fixed head (v2) — read each field by name in declaration order (docs/ota_protocol.md §4)
+  br_t r = { b, hdr, 0, 1 };
+  br_skip(&r, 4 + 4);                               // MAGIC + MOTA_TOTAL_SIZE (already validated above)
+  if (br_u8(&r) != 2) return 0;                     // format_ver (v2: adds hw_id[32] to the fixed head)
+  uint8_t flags  = br_u8(&r);
+  br_u8(&r);                                        // hash_algo
+  br_skip(&r, 4 + 4);                               // target_id, fw_version (unused here)
+  o->image_size   = br_u32(&r);
+  o->payload_size = br_u32(&r);
+  uint8_t bsl     = br_u8(&r);
+  br_skip(&r, 4);                                   // merkle_root
+  const uint8_t* ih = br_take(&r, 32); if (ih) memcpy(o->image_hash, ih, 32);
+  o->codec_id     = br_u8(&r);
+  br_skip(&r, 32);                                  // hw_id (unused here)
   o->is_full      = (flags & MFLAG_FULL) ? 1 : 0;
-  uint32_t off = 8 + 89;                            // after the fixed head (57 + hw_id[32]); hw_id unused here
-  if (!o->is_full) { memcpy(o->base_hash, b + off, 8); off += 8; }
-  if (flags & MFLAG_SIGNED) { off += 32 + 64; }     // skip signer pubkey + signature
-  if (off + 4 > hdr) return 0;
-  o->approval_addr = addr + off;
-  o->approved = (memcmp(b + off, APRV, 4) == 0) ? 1 : 0;
-  off += 4;
+  if (!o->is_full) { const uint8_t* bh = br_take(&r, 8); if (bh) memcpy(o->base_hash, bh, 8); }
+  if (flags & MFLAG_SIGNED) br_skip(&r, 32 + 64);   // signer pubkey + signature
+  if (!r.ok) return 0;                              // signed delta's head can exceed the 200B read window
+  o->approval_addr = addr + r.n;
+  const uint8_t* ap = br_take(&r, 4);
+  o->approved = (ap && memcmp(ap, APRV, 4) == 0) ? 1 : 0;
   if (bsl == 0 || bsl > 24 || o->payload_size == 0) return 0;
   uint32_t bs = 1u << bsl, bc = (o->payload_size + bs - 1) / bs;
-  off += bc * 4;                                    // leaves[]
+  uint32_t off = r.n + bc * 4;                      // leaves[] then payload
   o->payload_addr = addr + off;
   o->total = total;
   if (off + o->payload_size + 5 != total) return 0; // payload must end exactly at the trailer
