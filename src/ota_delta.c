@@ -3,9 +3,20 @@
 // (OTA_DELTA_HOST_TEST: the test TU provides the otah_* flash/settings/gpregret stubs + crc16).
 #include "ota_delta.h"
 #include "ota_layout.h"
+#include "ota_bl_info.h"
 #include "detools/detools.h"
 #include <string.h>
 #include <stdint.h>
+
+// Capability marker the running MeshCore app scans for (see ota_bl_info.h). `used` + the reference in
+// ota_delta_check_and_apply() keep it through -ffunction/data-sections, --gc-sections and -flto.
+__attribute__((used)) const mota_bl_info_t g_mota_bl_info = {
+  { MOTA_BL_MAGIC0, MOTA_BL_MAGIC1, MOTA_BL_MAGIC2, MOTA_BL_MAGIC3,
+    MOTA_BL_MAGIC4, MOTA_BL_MAGIC5, MOTA_BL_MAGIC6, MOTA_BL_MAGIC7 },
+  MOTA_BL_APPLY_ABI,
+  (uint16_t)(1u << 2),                 // this bootloader applies in-place (codec_id 2) deltas
+  { 0, 0, 0, 0 },
+};
 
 // ---- `.mota` / EndF on-wire constants (mirror of src/helpers/ota/OtaFormat.h, C-friendly) ---------
 static const uint8_t MAGIC[4]    = { 'm','O','T','A' };
@@ -34,6 +45,7 @@ static const uint8_t APRV[4]     = { 'A','P','R','V' };
   static void     fl_write_words(uint32_t a, const uint32_t* s, uint32_t nw) { otah_write_words(a, s, nw); }
   static uint32_t gpregret_get(void)                                 { return otah_gpregret_get(); }
   static void     gpregret_set(uint32_t v)                           { otah_gpregret_set(v); }
+  static void     gpregret2_set(uint32_t v)                          { (void)v; }   // diag no-op on host
   static uint16_t crc16_region(uint32_t a, uint32_t len)             { return otah_crc16(a, len); }
 #else
   #include "nrf.h"
@@ -43,11 +55,24 @@ static const uint8_t APRV[4]     = { 'A','P','R','V' };
   #include "bootloader_settings.h"
   #include "dfu_types.h"
   #define APP_BASE        ((uint32_t)DFU_BANK_0_REGION_START)
-  static void     fl_read(uint32_t a, void* d, uint32_t n)            { memcpy(d, (const void*)(uintptr_t)a, n); }
+  // Read flash through a VOLATILE pointer. In-place apply WRITES flash (nrfx_nvmc_words_write) and then
+  // READS IT BACK here (decode readback + the post-apply sha256). Those touch the same flash through two
+  // different pointer provenances (an integer-cast read pointer vs the nrfx write), so whole-program -flto
+  // alias analysis concludes they can't alias and caches/reorders a STALE read — the post-check then hashes
+  // pre-decode bytes -> mismatch -> apply silently refused. (-fno-strict-aliasing does NOT help: this is
+  // provenance, not type-based aliasing.) The host harness can't reproduce it: there read+write hit the
+  // same C array, an obvious alias. volatile forces the actual load each time.
+  static void     fl_read(uint32_t a, void* d, uint32_t n) {
+    const volatile uint8_t* s = (const volatile uint8_t*)(uintptr_t)a; uint8_t* o = (uint8_t*)d;
+    for (uint32_t i = 0; i < n; i++) o[i] = s[i];
+  }
   static void     fl_erase(uint32_t page)                            { nrfx_nvmc_page_erase(page); }
   static void     fl_write_words(uint32_t a, const uint32_t* s, uint32_t nw) { nrfx_nvmc_words_write(a, s, nw); }
   static uint32_t gpregret_get(void)                                 { return NRF_POWER->GPREGRET; }
   static void     gpregret_set(uint32_t v)                           { NRF_POWER->GPREGRET = v; }
+  // Diagnostic: stash an apply bail/progress code in GPREGRET2 (retained across the boot to the app, which
+  // reads it back). SD is off in the bootloader, so a direct write is fine.
+  static void     gpregret2_set(uint32_t v)                          { NRF_POWER->GPREGRET2 = v; }
   static uint16_t crc16_region(uint32_t a, uint32_t len)             { return crc16_compute((const uint8_t*)(uintptr_t)a, len, NULL); }
   static void otah_settings_commit(uint16_t bank0, uint16_t crc, uint32_t size) {
     bootloader_settings_t s; const bootloader_settings_t* cur;
@@ -249,21 +274,31 @@ static void clear_approval(const struct mota_min* o) {
 }
 
 bool ota_delta_check_and_apply(void) {
+  // Force a volatile read of the capability marker so -flto / --gc-sections cannot fold the reference away
+  // and drop it — the running app scans the bootloader flash for it (ota_bl_info.h / OtaBlInfo.h).
+  volatile uint8_t keep = *(const volatile uint8_t*)&g_mota_bl_info.magic[0];
+  if (keep == 0) return false;                      // 'M' (0x4D) != 0, so never taken; keeps the marker live
+  // ---- DIAGNOSTIC: stash a bail/progress code in GPREGRET2; the app reads it back into `ota status`.
+  // 0xB0 entered (pre-gate) | 0xB1 gate passed (GPREGRET was 0x6A) | 0xB2 no/unapproved mota |
+  // 0xB3 full/bad-codec | 0xB4 no body_len | 0xB5 base mismatch | 0x9N detools err N | 0xB6 wrong size |
+  // 0xB7 result-hash mismatch | 0xB8 SUCCESS. If status shows 0xB0 -> GPREGRET wasn't 0x6A at the bootloader.
+  gpregret2_set(0xB0);
   if (gpregret_get() != GPREGRET_OTA_APPLY) return false;
   gpregret_set(0);                                  // consume the trigger so we never loop
+  gpregret2_set(0xB1);
 
   struct mota_min m;
   uint32_t mota_addr = scan_mota(&m);
-  if (!mota_addr || !m.approved) return false;      // nothing staged / not approved
+  if (!mota_addr || !m.approved) { gpregret2_set(0xB2); return false; }   // nothing staged / not approved
 
   // base check (non-destructive): the running image's body must hash to the delta's base_hash.
   // Any pre-apply rejection clears the approval (this `.mota` is not applicable) and boots normally.
   uint32_t body_len;
   uint8_t base32[32];
-  if (m.is_full || m.codec_id != CODEC_INPLACE) goto reject;
-  if (!find_body_len(&body_len))                goto reject;
+  if (m.is_full || m.codec_id != CODEC_INPLACE) { gpregret2_set(0xB3); goto reject; }
+  if (!find_body_len(&body_len))                { gpregret2_set(0xB4); goto reject; }
   sha256_region(APP_BASE, body_len, base32);
-  if (memcmp(base32, m.base_hash, 8) != 0)      goto reject;     // wrong base
+  if (memcmp(base32, m.base_hash, 8) != 0)      { gpregret2_set(0xB5); goto reject; }   // wrong base
 
   // commit point: clear approval BEFORE the destructive apply (a failure must not retry)
   clear_approval(&m);
@@ -274,13 +309,15 @@ bool ota_delta_check_and_apply(void) {
   int r = detools_apply_patch_in_place_callbacks(dt_mr, dt_mw, dt_me, dt_ss, dt_sg, dt_pr,
                                                  (size_t)m.payload_size, &c);
   cache_flush();
-  if (r < 0 || (uint32_t)r != m.image_size) return false;       // failed -> settings untouched -> DFU
+  if (r < 0) { gpregret2_set(0x90 | ((uint32_t)(-r) & 0x0F)); return false; }   // detools error code in low nibble
+  if ((uint32_t)r != m.image_size) { gpregret2_set(0xB6); return false; }       // wrong reconstructed size
 
   uint8_t h[32];
   sha256_region(APP_BASE, m.image_size, h);
-  if (memcmp(h, m.image_hash, 32) != 0) return false;           // result mismatch -> DFU
+  if (memcmp(h, m.image_hash, 32) != 0) { gpregret2_set(0xB7); return false; }   // result mismatch -> DFU
 
   otah_settings_commit(BANK_VALID_APP_V, crc16_region(APP_BASE, m.image_size), m.image_size);
+  gpregret2_set(0xB8);
   return true;
 
 reject:
