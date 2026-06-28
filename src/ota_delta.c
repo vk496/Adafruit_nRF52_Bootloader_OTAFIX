@@ -12,7 +12,8 @@ static const uint8_t MAGIC[4]    = { 'm','O','T','A' };
 static const uint8_t TRAILER[5]  = { 'v','k','4','9','6' };
 static const uint8_t ENDF[4]     = { 'E','n','d','F' };
 static const uint8_t APRV[4]     = { 'A','P','R','V' };
-#define ENDF_LEN          16u
+#define ENDF_LEN          56u    // fixed trailer: marker(4)+body_len(4)+body_hash8(8)+fw_ver(4)+target(4)+hw_id(32)
+#define MOTA_MFL          197u   // fixed manifest-minus-leaves length (head 89 + base_hash 8 + signer 32 + sig 64 + approval 4)
 #define MFLAG_FULL        0x01u
 #define MFLAG_SIGNED      0x02u
 #define CODEC_INPLACE     2u
@@ -159,21 +160,22 @@ struct mota_min {
   uint8_t  base_hash[8], image_hash[32], codec_id, is_full, approved;
 };
 static int parse_mota_at(uint32_t addr, struct mota_min* o) {
-  uint8_t b[200];
+  uint8_t b[8 + MOTA_MFL];                          // MAGIC+total + the whole fixed manifest-minus-leaves
   uint32_t avail = MOTA_NRF52_FS_START - addr;
   uint32_t hdr = avail < sizeof(b) ? avail : sizeof(b);
-  if (hdr < 8 + 89 + 4 + 5) return 0;               // fixed head is 89 in v2 (57 + hw_id[32])
+  if (hdr < 8 + MOTA_MFL) return 0;                 // need the whole fixed manifest in `b` (trailer read separately)
   fl_read(addr, b, hdr);
   if (memcmp(b, MAGIC, 4) != 0) return 0;
   uint32_t total = rd_u32(b + 4);
-  if (total < 8 + 89 + 4 + 5 || total > avail) return 0;
+  if (total < 8 + MOTA_MFL + 5 || total > avail) return 0;
   uint8_t tr[5]; fl_read(addr + total - 5, tr, 5);
   if (memcmp(tr, TRAILER, 5) != 0) return 0;
 
-  // manifest fixed head (v2) — read each field by name in declaration order (docs/ota_protocol.md §4)
+  // Fixed-layout manifest — every field at a constant offset; base_hash/signer/signature are always
+  // present (zero-filled when not applicable), so there are no conditionals (docs/ota_protocol.md §4).
   br_t r = { b, hdr, 0, 1 };
   br_skip(&r, 4 + 4);                               // MAGIC + MOTA_TOTAL_SIZE (already validated above)
-  if (br_u8(&r) != 2) return 0;                     // format_ver (v2: adds hw_id[32] to the fixed head)
+  if (br_u8(&r) != 2) return 0;                     // format_ver
   uint8_t flags  = br_u8(&r);
   br_u8(&r);                                        // hash_algo
   br_skip(&r, 4 + 4);                               // target_id, fw_version (unused here)
@@ -185,9 +187,9 @@ static int parse_mota_at(uint32_t addr, struct mota_min* o) {
   o->codec_id     = br_u8(&r);
   br_skip(&r, 32);                                  // hw_id (unused here)
   o->is_full      = (flags & MFLAG_FULL) ? 1 : 0;
-  if (!o->is_full) { const uint8_t* bh = br_take(&r, 8); if (bh) memcpy(o->base_hash, bh, 8); }
-  if (flags & MFLAG_SIGNED) br_skip(&r, 32 + 64);   // signer pubkey + signature
-  if (!r.ok) return 0;                              // signed delta's head can exceed the 200B read window
+  const uint8_t* bh = br_take(&r, 8); if (bh) memcpy(o->base_hash, bh, 8);   // base_hash (zero for full)
+  br_skip(&r, 32 + 64);                             // signer pubkey + signature (zero when unsigned)
+  if (!r.ok) return 0;
   o->approval_addr = addr + r.n;
   const uint8_t* ap = br_take(&r, 4);
   o->approved = (ap && memcmp(ap, APRV, 4) == 0) ? 1 : 0;
@@ -211,7 +213,7 @@ static int parse_mota_at(uint32_t addr, struct mota_min* o) {
 // approved. (EndF is the mirror image: the app image grows up from APP_BASE, so the current trailer is
 // the LOWEST valid marker and find_body_len scans bottom-up. Each marker is scanned from the end where
 // the current one is encountered first.)
-#define MOTA_MIN_LEN  (8 + 89 + 4 + 5)
+#define MOTA_MIN_LEN  (8 + MOTA_MFL + 5)
 static uint32_t scan_mota(struct mota_min* o) {
   uint32_t top = (MOTA_NRF52_FS_START - MOTA_MIN_LEN) & ~(PAGE - 1);
   for (uint32_t a = top + PAGE; a > APP_BASE; ) {        // walk page boundaries high -> low
